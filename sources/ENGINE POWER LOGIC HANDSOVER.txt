@@ -1,0 +1,238 @@
+================================================================================
+                    HANDOVER SPECIFICATION: ENGINE POWER LOGIC
+================================================================================
+
+-------------------------------------------------------------------------------
+1.  FIXED VEHICLE CONSTANTS (to be defined per session)
+-------------------------------------------------------------------------------
+Parameter                Symbol       Value / Source
+-------------------------------------------------------------------------------
+Air Density              rho          Calculated from weather data (pressure & temp)
+Drag Area                CdA          From the CdA handover (derived per session)
+Car Mass                 m            Session‑dependent: qualifying (~830 kg) or race
+Rolling Resistance Coeff Cr           Assumption (tunable, typically 0.012–0.020)
+Tyre Rolling Radius      r            Derived from max speed point
+Drivetrain Efficiency    eta          0.95 (fixed assumption)
+Thermal Efficiency       eta_thermal  0.46 (fixed assumption)
+Gravity                  g            9.81 m/s² (constant)
+
+Gear Ratios (Overall) – derived from car data (see CdA handover):
+  Gear 2   R2 = <calculated>
+  Gear 3   R3 = <calculated>
+  Gear 4   R4 = <calculated>
+  Gear 5   R5 = <calculated>
+  Gear 6   R6 = <calculated>
+  Gear 7   R7 = <calculated>
+  Gear 8   R8 = <calculated>
+
+-------------------------------------------------------------------------------
+2.  DATA ACQUISITION & ALIGNMENT
+-------------------------------------------------------------------------------
+Retrieve from Fast F1 API:
+  a) Car Telemetry:    date, speed (kph), rpm, n_gear, throttle (%), brake (0/100)
+  b) Weather:          date, air_temperature, pressure, wind_speed, wind_direction
+  c) Location:         date, x, y
+
+Data Alignment:
+  - For each car telemetry row, match the nearest weather and location records by
+    timestamp (nearest‑time merge).
+  - Convert speed: v (m/s) = speed (kph) / 3.6
+
+-------------------------------------------------------------------------------
+3.  DATA FILTERING RULES (Pre‑processing)
+-------------------------------------------------------------------------------
+a) Accept only rows where: Throttle == 100  AND  Brake == 0   (full power)
+b) Reject rows where:      n_gear == 0
+c) Reject transients:      discard points where RPM drops > 500 within 0.2 s
+                           (post-upshift)
+
+-------------------------------------------------------------------------------
+4.  STEP‑BY‑STEP CALCULATION LOGIC (for each valid datapoint)
+-------------------------------------------------------------------------------
+
+Step 1 – Kinematics:
+  omega_w = v / r                               (wheel angular speed, rad/s)
+  omega_e = (RPM * 2 * pi) / 60                  (engine angular speed, rad/s)
+
+Step 2 – Acceleration (central difference):
+  a = (v_{i+1} - v_{i-1}) / (t_{i+1} - t_{i-1}) (m/s²)
+  (For first/last rows, use forward/backward difference)
+
+Step 3 – Tractive Power at Wheels:
+  F_drag   = 0.5 * rho * CdA * v²
+  F_rr     = Cr * m * g
+  F_inert  = m * a
+  P_w      = (F_drag + F_rr + F_inert) * v      (Watts)
+
+Step 4 – Total Crankshaft Torque (ICE + MGU‑K):
+  T_total = P_w / (omega_e * eta)               (Nm)
+
+Step 5 – MGU‑K Maximum Power (Art. C5.2.8):
+  This depends on the session type (Overtake Mode active in qualifying).
+  For qualifying, assume Overtake active:
+      P_MGU_max = 7100 - 20 * v                 (v in kph)
+      P_MGU_max = min(P_MGU_max, 350)           (cap at 350 kW)
+      If v > 355 kph: P_MGU_max = 0
+
+  For race/sprint, use the appropriate non‑Overtake curve.
+
+Step 6 – MGU‑K Torque:
+  T_MGU = (P_MGU_max * 1000) / omega_e          (Nm)
+  Clamp per Art. C5.2.11:
+      T_MGU = max( T_MGU, -500 )
+      T_MGU = min( T_MGU,  500 )                (must be between -500 and +500)
+
+Step 7 – Isolate ICE Torque:
+  T_ICE = T_total - T_MGU                       (Nm)
+
+-------------------------------------------------------------------------------
+5.  FUEL FLOW CAPPING (Validation / Clipping)
+-------------------------------------------------------------------------------
+Step 8 – Maximum Fuel Energy Flow (Art. C5.2.3 & C5.2.4):
+  EF_max = min( 3000,  0.27 * RPM + 165 )       (MJ/h)
+  (Linear term applies below 10,500 rpm; above, the 3000 cap dominates)
+
+Step 9 – Maximum ICE Power from Fuel:
+  P_ICE_max = (EF_max / 3.6) * eta_thermal      (kW)
+
+Step 10 – Maximum ICE Torque from Fuel:
+  T_ICE_max = (P_ICE_max * 1000) / omega_e      (Nm)
+
+Step 11 – Apply Cap (if required):
+  If T_ICE > T_ICE_max  then  T_ICE = T_ICE_max
+
+-------------------------------------------------------------------------------
+6.  ENGINE BRAKING / NEGATIVE TORQUE FLOOR (Art. C5.12.3)
+    (Applied only when Throttle == 0  AND  Brake == 100)
+-------------------------------------------------------------------------------
+Step 12 – Regulatory Minimum Torque:
+  T_min = -0.0027 * RPM - 30                    (Nm)
+  (This is the most negative torque permitted; the actual demand must be
+   greater – i.e., less negative – than this value)
+
+Step 13 – Harvesting Availability Check (Art. C5.2.10):
+  The MGU‑K may harvest up to 8.5 MJ per lap (or 9.0 MJ with Overtake).
+  If the harvested energy in the current lap has already reached this limit:
+      T_min = 0                                  (no regen / no engine braking)
+
+Step 14 – Applied Negative Torque:
+  T_demand_braking = T_min + 0.5                (Nm)
+  (The +0.5 Nm ensures compliance by staying safely above the floor)
+
+-------------------------------------------------------------------------------
+7.  DRIVER DEMAND MAPPING (for any Throttle position, 0% – 100%)
+-------------------------------------------------------------------------------
+Step 15 – Base ICE Torque from Full‑Throttle Map:
+  Fit a 4th‑order polynomial to the (RPM, T_ICE) data points from Step 7:
+      T_ICE_base = c0 + c1*RPM + c2*RPM² + c3*RPM³ + c4*RPM⁴
+
+Step 16 – MGU‑K Torque at current speed:
+  Use Step 5 and Step 6 to compute T_MGU based on current v and mode.
+
+Step 17 – Total Available Torque at 100% Throttle:
+  T_available = T_ICE_base + T_MGU              (Nm)
+
+Step 18 – Scaled by Driver Demand:
+  T_demand = (Throttle / 100) * T_available     (Nm)
+
+Step 19 – Apply Engine Braking Floor (if off‑throttle):
+  If Throttle == 0 and Brake == 100:
+      T_demand = min( T_demand,  T_min + 0.5 )  (cannot be more negative)
+
+Step 20 – Final Output:
+  T_output = T_demand                           (Nm)
+  This is the net torque at the engine crankshaft that the powertrain
+  controller will target.
+
+-------------------------------------------------------------------------------
+8.  VALIDATION CHECK (at the maximum speed point of the session)
+-------------------------------------------------------------------------------
+Run this sanity check on the row where speed is highest. Use the actual values
+from that row (v_max, RPM, gear) and the constants defined above.
+
+Calculate:
+  Drag force     = 0.5 * rho * CdA * v_max²
+  Rolling resist. = Cr * m * g
+  Tractive force = Drag + Rolling resist. (assuming a ≈ 0 at top speed)
+  Wheel power    = Tractive force * v_max
+  Total engine torque = (Wheel power * 1000) / (omega_e * eta)
+  MGU‑K torque   = (P_MGU_max * 1000) / omega_e   (using the power cap for that speed)
+  Derived ICE torque = Total engine torque – MGU‑K torque
+
+Then check against fuel cap:
+  At the given RPM, compute EF_max and T_ICE_max.
+  Ensure Derived ICE torque < T_ICE_max (if not, the constants or data are inconsistent).
+
+Mass Sensitivity:
+  Re‑run the validation with mass ± 5% to confirm stability of the derived ICE torque.
+
+-------------------------------------------------------------------------------
+9.  ENERGY MANAGEMENT & BATTERY CAPACITY (Art. C5.2.9 & C5.2.10)
+-------------------------------------------------------------------------------
+The regulations impose two key limits on electrical energy:
+
+  a) Per‑Lap Recharge Limit (C5.2.10): The MGU‑K may harvest a maximum of 8.5 MJ
+     per lap (or 9.0 MJ with Overtake active). This caps the total electrical
+     energy that can be deployed in a lap.
+
+  b) State of Charge Swing (C5.2.9): The difference between the maximum and
+     minimum state of charge of the Energy Store must not exceed 4 MJ at any
+     time the car is on track.
+
+Critical Implication for the Model:
+  The total physical capacity of the battery is irrelevant for torque
+  calculations. The 4 MJ limit is a "sliding window" on the battery's state of
+  charge. It forces the car to constantly oscillate between deploying and
+  harvesting energy within each lap, rather than storing large amounts for later.
+
+Energy Tracking Logic (to be implemented in the script):
+  The code does NOT need a "battery percentage" or "total capacity" variable.
+  Instead, it should track the net cumulative energy over the current lap:
+
+    net_energy = energy_deployed - energy_harvested
+
+  The MGU‑K deployment logic must ensure that net_energy never exceeds 4 MJ
+  (i.e., the battery state of charge never drops more than 4 MJ below its peak).
+  When this limit is reached, deployment is paused until harvesting occurs.
+
+  In practice, the MGU‑K power curve (Step 5) already limits instantaneous
+  power to 350 kW. The 4 MJ window simply limits how long that power can be
+  sustained before recharging is required.
+
+What This Means for the Torque Calculation:
+  The instantaneous torque at any given moment depends ONLY on the speed-
+  dependent MGU‑K power limit (Step 5). The battery capacity does not appear
+  anywhere in the torque equations. The 4 MJ window acts as a logical
+  constraint on deployment duration, not on instantaneous force output.
+
+-------------------------------------------------------------------------------
+10. OUTPUT DATA STRUCTURE
+-------------------------------------------------------------------------------
+The script shall append the following calculated columns to the filtered dataset:
+
+  omega_e        Engine angular speed (rad/s)
+  accel          Longitudinal acceleration (m/s²)
+  P_w            Wheel tractive power (W)
+  T_total        Total crankshaft torque (ICE + MGU‑K) (Nm)
+  P_MGU          MGU‑K electrical power (W)
+  T_MGU          MGU‑K mechanical torque (clamped) (Nm)
+  T_ICE_capped   Final ICE torque (after fuel capping) (Nm)
+  EF_max         Maximum fuel energy flow (MJ/h)
+  net_energy     Cumulative net energy (deployed - harvested) over current lap (MJ)
+
+-------------------------------------------------------------------------------
+11. IMPLEMENTATION NOTES
+-------------------------------------------------------------------------------
+- The Fast F1 API returns asynchronous data streams. Align weather and location
+  to car telemetry using nearest‑time matching.
+- Session type (qualifying/race) determines which MGU‑K power curve to use.
+- Rolling resistance coefficient (Cr) is tunable; start with 0.012 and adjust if
+  validation shows excessive residual force.
+- Gear 1 is excluded from all calculations.
+- Use vectorised operations (Pandas/Numpy) rather than explicit loops for
+  efficient processing of high‑frequency data.
+- The battery capacity is NOT a required input. The 4 MJ state‑of‑charge swing
+  (C5.2.9) and 8.5 MJ per‑lap recharge limit (C5.2.10) are the only energy
+  constraints that affect the model.
+
+================================================================================
