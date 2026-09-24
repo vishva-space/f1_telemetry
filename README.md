@@ -7,6 +7,8 @@ This project reads Formula 1 telemetry data and calculates two main outputs:
 
 The project is designed to be simple to run, even for someone who is comfortable with telemetry data but not necessarily with Python programming.
 
+Special thanks to RedKakusu on Discord for providing the initial project requirements and helping shape the direction of this analysis.
+
 ---
 
 ## What this project does
@@ -280,6 +282,12 @@ cd /home/vishwa/my_files/f1_telemetry
 ```
 
 Then open the generated result files in [outputs](outputs).
+
+---
+
+## License
+
+This project is licensed under the MIT License. See [LICENSE](LICENSE) for details.
 
 ---
 
