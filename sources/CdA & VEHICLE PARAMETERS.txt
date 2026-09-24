@@ -1,0 +1,210 @@
+================================================================================
+                    HANDOVER SPECIFICATION: CdA & VEHICLE PARAMETERS
+================================================================================
+
+OBJECTIVE
+---------
+Calculate the car's Drag Area (CdA) and other key drivetrain parameters at its 
+maximum speed, using a power balance, weather‑corrected air density, and a 
+properly normalised wind component derived from the car's heading.
+
+CORE ASSUMPTIONS (Fixed Values)
+-------------------------------
+- Engine Power (P_engine)      = 750,000 W   (Assumed peak ICE power)
+- Drivetrain Efficiency (η)    = 0.95        (95% efficiency from engine to wheels)
+- Wheel Radius (r_wheel)       = 0.355 m     (Typical F1 tire radius)
+- Specific Gas Constant (R)    = 287.05
+- Coordinate System            : X+ = North, Y+ = East (from location.csv)
+
+CORE EQUATIONS
+--------------
+
+1. AIR DENSITY (ρ)
+   ρ = (P_hPa × 100) / (287.05 × (T_C + 273.15))
+   Where:
+     - P_hPa = Air pressure (hPa) from weather data
+     - T_C   = Air temperature (°C) from weather data
+
+2. CAR HEADING (θ_car)
+   The car's heading is derived from two consecutive position points 
+   (location.csv) that bracket the timestamp of maximum speed.
+
+   Δx = x_{i+1} - x_i
+   Δy = y_{i+1} - y_i
+   θ_car = atan2(Δy, Δx)   [radians, measured clockwise from North (X+ axis)]
+
+   Note: The location data must be filtered to ensure the car is on a straight 
+   section (small change in heading) to avoid curvature errors.
+
+3. HEADWIND COMPONENT (v_wind_head)
+   The meteorological wind direction (wind_direction) is defined as the 
+   direction FROM which the wind blows (e.g., 180° = South wind, blows northward).
+   The wind vector (direction it blows TOWARDS) is:
+     θ_wind = wind_direction + 180°  (mod 360°)
+
+   The angle between the car's heading and the wind vector:
+     Δθ = θ_wind - θ_car   [radians]
+
+   The effective headwind component (positive = headwind, negative = tailwind):
+     v_wind_head = wind_speed × cos(Δθ)
+
+   Therefore:
+     v_rel = v_car + v_wind_head
+
+   where v_car = speed at max point (m/s) = speed_kph / 3.6
+
+4. CdA (Drag Area)
+   CdA = (2 × P_wheels) / (ρ × v_rel³)
+   Where P_wheels = P_engine × η = 750,000 × 0.95 = 712,500 W
+
+5. ENGINE ANGULAR VELOCITY (ω_engine)
+   ω_engine = RPM × (2π / 60)    [rad/s]
+
+6. ENGINE TORQUE (τ_engine)
+   τ_engine = P_engine / ω_engine    [Nm]
+
+7. OVERALL GEAR RATIO at Max Speed (i_overall)
+   i_overall = (RPM × 2π × r_wheel) / (v_mps × 60)
+
+8. WHEEL TORQUE (τ_wheel)
+   τ_wheel = τ_engine × i_overall × η    [Nm]
+
+9. AVERAGE GEAR RATIOS (for each gear used)
+   For each gear number (n_gear), calculate the average Overall Ratio
+   across all valid telemetry rows where that gear is engaged.
+   Formula: Avg_i_gear = Average( RPM × 2π × r_wheel / (speed_mps × 60) )
+   (Rows with missing RPM, speed=0, or gear=0/null are excluded)
+
+INPUTS REQUIRED
+--------------------------------
+| Source         | Columns Used                                     |
+|----------------|--------------------------------------------------|
+| car_data       | speed, rpm, n_gear, date                         |
+| weather        | air_temperature, pressure, wind_speed,           |
+|                | wind_direction, meeting_key, session_key, date   |
+| location       | x, y, date (to compute heading)                  |
+
+PROCESS OVERVIEW (Step by Step)
+-------------------------------
+1. Convert speed to m/s.
+2. Compute Overall Ratio for every row: (RPM × 2π × 0.355) / (speed_mps × 60)
+3. Filter out invalid rows (nulls, zeros).
+4. Group by gear and calculate the average Overall Ratio per gear.
+5. Find the row with the maximum speed value in car_data.
+6. Extract RPM, speed, gear, meeting_key, session_key, and timestamp from that row.
+7. Match to the closest weather record (by timestamp) for the same meeting/session.
+8. Match to the closest location records before and after the max speed timestamp.
+9. Compute car heading from the location points (see Equation 2).
+10. Compute the headwind component using wind_speed and wind_direction (see Equation 3).
+11. Calculate relative speed: v_rel = max_speed_mps + v_wind_head.
+12. Calculate air density (ρ) from pressure and temperature.
+13. Calculate CdA using the power balance equation (see Equation 4).
+14. Calculate engine torque, wheel torque, and overall ratio at max speed.
+15. Compile all outputs into a single table.
+
+OUTPUTS GENERATED (Copy of your sheet list)
+-------------------------------------------
+1.  CdA (m²)
+2.  Max Speed (kph)
+3.  Max Speed (m/s)
+4.  Max RPM
+5.  Max Gear
+6.  Engine Torque at Max Speed (Nm)
+7.  Wheel Torque at Max Speed (Nm)
+8.  Overall Ratio at Max Speed
+9.  Air Density (kg/m³)
+10. Gear 2 Overall Ratio        (average ratio for 2nd gear)
+11. Gear 3 Overall Ratio        (average ratio for 3rd gear)
+12. Gear 4 Overall Ratio        (average ratio for 4th gear)
+13. Gear 5 Overall Ratio        (average ratio for 5th gear)
+14. Gear 6 Overall Ratio        (average ratio for 6th gear)
+15. Gear 7 Overall Ratio        (average ratio for 7th gear)
+16. Gear 8 Overall Ratio        (average ratio for 8th gear)
+
+Note: Gear 1 is omitted as it is typically not used at maximum speed and may
+      have insufficient data for a reliable average.
+
+KEY ASSUMPTIONS & LIMITATIONS (Important to document)
+-----------------------------------------------------
+- P_engine is fixed at 750kW. Real ICE power varies with RPM, fuel flow, and mode.
+- Rolling resistance is neglected. At high speed, drag dominates, but this
+  introduces a small overestimation of CdA.
+- The wind is normalised using the car's heading derived from GPS location data.
+  This removes the need to assume a direct headwind; the component along the
+  car's direction is used correctly.
+- Tire radius is fixed at 0.355m. Real tires grow with speed and deflect under load.
+- Steady-state is assumed at max speed (no acceleration, flat track).
+- Air density uses standard dry-air gas constant; humidity is not accounted for.
+- The coordinate system for location data must be X+ = North, Y+ = East.
+- The wind direction is assumed to be meteorological (direction from which the wind originates).
+
+DATA QUALITY NOTES
+------------------
+- The DRS column is present in car_data but currently empty; it is ignored.
+- The location (x, y, z) data is used only for heading calculation; z is not used.
+- Timestamps are used to match weather data to the exact moment of max speed.
+- For heading computation, only location points that are on a straight section
+  (i.e., minimal change in heading over the interval) should be used to avoid
+  curvature errors.
+
+EXPECTED OUTPUT FORMAT
+----------------------
+A two-column table:
+  Column A: Parameter Name (text)
+  Column B: Value (number)
+
+Example:
+  CdA (m²)                    | 1.672
+  Max Speed (kph)             | 323
+  Max Speed (m/s)             | 89.72
+  Max RPM                     | 11164
+  Max Gear                    | 8
+  Engine Torque at Max Speed  | 609.6
+  Wheel Torque at Max Speed   | 2810.3
+  Overall Ratio at Max Speed  | 4.61
+  Air Density (kg/m³)         | 1.1429
+  Gear 2 Overall Ratio        | 11.512
+  Gear 3 Overall Ratio        | 9.261
+  Gear 4 Overall Ratio        | 7.645
+  Gear 5 Overall Ratio        | 6.685
+  Gear 6 Overall Ratio        | 5.771
+  Gear 7 Overall Ratio        | 5.133
+  Gear 8 Overall Ratio        | 4.609
+
+================================================================================
+
+MASS VALIDATION CHECK
+================================================================================
+
+At maximum speed, acceleration is zero. The force balance is:
+
+    F_trac = F_drag + F_rr
+
+Where:
+    F_trac = P_wheels / v_max
+    F_drag = 0.5 × ρ × CdA × v_max²
+    F_rr   = C_rr × m × g
+
+Since the car's mass is constrained by regulations (minimum 768 kg + driver + fuel),
+we can use this equation to validate the calculated CdA.
+
+If we assume a realistic mass for qualifying (~860 kg) and a realistic rolling
+resistance coefficient for F1 tires (C_rr ≈ 0.018–0.025), the residual force
+(F_trac - F_drag) must fall within this range.
+
+Validation Rules:
+    1. If F_trac - F_drag < 0          → CdA is TOO HIGH (impossible top speed)
+    2. If F_trac - F_drag > 0.025 × m × g → CdA is TOO LOW (unrealistic rolling resistance)
+    3. If F_trac - F_drag is negative or requires C_rr > 0.035 → CdA must be adjusted.
+
+This check requires no additional input data. It uses only the outputs already
+calculated (CdA, F_trac, air density) and the known regulatory minimum mass.
+
+Equation for the sanity check:
+
+    C_rr_calculated = (F_trac - F_drag) / (m_assumed × g)
+
+Where m_assumed should be a realistic value for the session being analyzed
+(~860 kg for qualifying, ~900+ kg for race laps).
+
+================================================================================
